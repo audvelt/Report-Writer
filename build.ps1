@@ -12,6 +12,11 @@ Write-Host "Cleaning old build artifacts..."
 if (Test-Path build) { Remove-Item build -Recurse -Force }
 if (Test-Path dist)  { Remove-Item dist  -Recurse -Force }
 
+# Clean cache before building
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue _build
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue __pycache__
+
 # Build using spec file (includes manifest for drag-and-drop fix)
 Write-Host "Building executable with .spec file..."
 pyinstaller ReportWriter.spec
