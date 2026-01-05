@@ -5,6 +5,9 @@ Description:
     Samsung Quality Lab report writing tool.
 """
 
+# Application version - UPDATE THIS WITH EACH RELEASE!
+APP_VERSION = "1.0.1"
+
 import sys
 import os
 import json
@@ -18,8 +21,8 @@ try:
                                  QHBoxLayout, QLabel, QPushButton, QCheckBox, 
                                  QTextEdit, QFileDialog, QScrollArea, QGroupBox,
                                  QLineEdit, QMessageBox, QTabWidget, QGridLayout,
-                                 QToolButton)
-    from PyQt5.QtCore import Qt, QTimer
+                                 QToolButton, QProgressDialog)
+    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
     from PyQt5.QtGui import QPixmap, QFont, QIcon
 except ImportError as e:
     print(f"Error importing PyQt5: {e}")
@@ -2845,6 +2848,130 @@ class ValveTab(QWidget):
             (self.internal_cylinder_b_section, VALVE_INTERNAL_CYLINDER_B_PATTERNS, 'component')
         ]
 
+# Auto-Update System
+class UpdateChecker:
+    """Check GitHub for application updates"""
+    
+    def __init__(self, current_version, github_repo):
+        """
+        current_version: Current app version (e.g., "1.0.0")
+        github_repo: GitHub repo in format "username/repository"
+        """
+        self.current_version = current_version
+        self.github_repo = github_repo
+        self.api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
+    
+    def check_for_updates(self):
+        """
+        Check if a newer version is available on GitHub
+        Returns dict with update info or None if no update/error
+        """
+        try:
+            import urllib.request
+            import json
+            
+            # Set timeout to 5 seconds
+            req = urllib.request.Request(self.api_url)
+            req.add_header('User-Agent', 'ReportWriter-UpdateChecker')
+            
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                
+                # Get latest version from tag name
+                latest_version = data['tag_name'].lstrip('v')
+                
+                # Compare versions
+                if self._is_newer_version(latest_version, self.current_version):
+                    # Find the .exe asset
+                    exe_asset = None
+                    for asset in data.get('assets', []):
+                        if asset['name'].endswith('.exe'):
+                            exe_asset = asset
+                            break
+                    
+                    if exe_asset:
+                        return {
+                            'available': True,
+                            'version': latest_version,
+                            'download_url': exe_asset['browser_download_url'],
+                            'release_url': data['html_url'],
+                            'release_notes': data.get('body', 'No release notes available'),
+                            'file_size': exe_asset.get('size', 0),
+                            'file_name': exe_asset['name']
+                        }
+            
+            return {'available': False}
+            
+        except Exception as e:
+            print(f"Update check failed: {e}")
+            return None
+    
+    def _is_newer_version(self, latest, current):
+        """Compare version strings (semantic versioning)"""
+        try:
+            latest_parts = [int(x) for x in latest.split('.')]
+            current_parts = [int(x) for x in current.split('.')]
+            
+            # Pad with zeros if needed
+            while len(latest_parts) < 3:
+                latest_parts.append(0)
+            while len(current_parts) < 3:
+                current_parts.append(0)
+            
+            return latest_parts > current_parts
+        except:
+            return False
+
+
+class UpdateDownloadThread(QThread):
+    """Thread for downloading updates in background"""
+    
+    progress = pyqtSignal(int, int)  # current, total
+    finished = pyqtSignal(str)  # downloaded file path
+    error = pyqtSignal(str)  # error message
+    
+    def __init__(self, download_url, file_name):
+        super().__init__()
+        self.download_url = download_url
+        self.file_name = file_name
+        self.cancelled = False
+    
+    def run(self):
+        """Download the update file"""
+        try:
+            import urllib.request
+            import tempfile
+            
+            # Download to temp directory
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, self.file_name)
+            
+            def progress_callback(block_count, block_size, total_size):
+                if self.cancelled:
+                    raise Exception("Download cancelled")
+                
+                downloaded = block_count * block_size
+                if total_size > 0:
+                    self.progress.emit(downloaded, total_size)
+            
+            # Download with progress
+            urllib.request.urlretrieve(
+                self.download_url,
+                temp_file,
+                reporthook=progress_callback
+            )
+            
+            if not self.cancelled:
+                self.finished.emit(temp_file)
+                
+        except Exception as e:
+            if not self.cancelled:
+                self.error.emit(str(e))
+    
+    def cancel(self):
+        """Cancel the download"""
+        self.cancelled = True
+
 class ReportGeneratorApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2861,6 +2988,11 @@ class ReportGeneratorApp(QMainWindow):
         self.autosave_timer = None
         self.is_autosaving = False
         self.autosave_interval = 60000  # 1 minute in milliseconds
+        
+        # Auto-update configuration
+        self.github_repo = "audvelt/Report-Writer"  # GitHub repo
+        self.download_thread = None
+        self.progress_dialog = None
         
         self.init_ui()
     
@@ -3527,6 +3659,146 @@ class ReportGeneratorApp(QMainWindow):
         
         self.stop_autosave()
         event.accept()
+    
+    # Auto-Update Methods
+    def check_for_updates_on_startup(self):
+        """Check for updates in background (called after window shown)"""
+        def check():
+            checker = UpdateChecker(APP_VERSION, self.github_repo)
+            return checker.check_for_updates()
+        
+        # Run in thread to not block UI
+        thread = threading.Thread(target=lambda: self._handle_update_check_result(check()))
+        thread.daemon = True
+        thread.start()
+    
+    def _handle_update_check_result(self, result):
+        """Handle update check result (runs in background thread)"""
+        if result and result.get('available'):
+            # Use QTimer to show dialog in main thread
+            QTimer.singleShot(0, lambda: self._show_update_dialog(result))
+    
+    def _show_update_dialog(self, update_info):
+        """Show update available dialog"""
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Update Available")
+        msg.setText(f"A new version is available!\n\nCurrent version: {APP_VERSION}\nLatest version: {update_info['version']}")
+        msg.setInformativeText("Would you like to download and install the update?")
+        
+        # Add release notes in details
+        if update_info.get('release_notes'):
+            msg.setDetailedText(f"What's New:\n\n{update_info['release_notes']}")
+        
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        
+        if msg.exec_() == QMessageBox.Yes:
+            self._download_update(update_info)
+    
+    def _download_update(self, update_info):
+        """Download the update file"""
+        try:
+            # Create progress dialog
+            self.progress_dialog = QProgressDialog(
+                "Downloading update...",
+                "Cancel",
+                0,
+                100,
+                self
+            )
+            self.progress_dialog.setWindowTitle("Updating ReportWriter")
+            self.progress_dialog.setWindowModality(Qt.WindowModal)
+            self.progress_dialog.setMinimumDuration(0)
+            self.progress_dialog.setValue(0)
+            
+            # Create download thread
+            self.download_thread = UpdateDownloadThread(
+                update_info['download_url'],
+                update_info['file_name']
+            )
+            
+            # Connect signals
+            self.download_thread.progress.connect(self._update_download_progress)
+            self.download_thread.finished.connect(self._update_download_finished)
+            self.download_thread.error.connect(self._update_download_error)
+            self.progress_dialog.canceled.connect(self._cancel_download)
+            
+            # Start download
+            self.download_thread.start()
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Download Error",
+                f"Failed to start download:\n{str(e)}"
+            )
+    
+    def _update_download_progress(self, current, total):
+        """Update download progress bar"""
+        if self.progress_dialog and total > 0:
+            percentage = int((current / total) * 100)
+            self.progress_dialog.setValue(percentage)
+            
+            # Show size info
+            current_mb = current / (1024 * 1024)
+            total_mb = total / (1024 * 1024)
+            self.progress_dialog.setLabelText(
+                f"Downloading update... ({current_mb:.1f} MB / {total_mb:.1f} MB)"
+            )
+    
+    def _update_download_finished(self, temp_file):
+        """Handle successful download"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        
+        # Show installation instructions
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Update Downloaded")
+        msg.setText("Update downloaded successfully!")
+        msg.setInformativeText(
+            "To complete the installation:\n\n"
+            "1. Close this application\n"
+            "2. Replace the old ReportWriter.exe with the new one\n"
+            "3. Restart the application\n\n"
+            f"New file location:\n{temp_file}\n\n"
+            "Would you like to open the download folder?"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        
+        if msg.exec_() == QMessageBox.Yes:
+            # Open folder containing downloaded file
+            import subprocess
+            folder = os.path.dirname(temp_file)
+            if platform.system() == 'Windows':
+                subprocess.run(['explorer', '/select,', temp_file])
+            elif platform.system() == 'Darwin':
+                subprocess.run(['open', '-R', temp_file])
+            else:
+                subprocess.run(['xdg-open', folder])
+    
+    def _update_download_error(self, error_msg):
+        """Handle download error"""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        
+        QMessageBox.critical(
+            self,
+            "Download Error",
+            f"Failed to download update:\n{error_msg}"
+        )
+    
+    def _cancel_download(self):
+        """Cancel the download"""
+        if self.download_thread:
+            self.download_thread.cancel()
+            self.download_thread = None
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
     
     def _save_motor_tab(self, motor_tab, images_folder):
         """Save motor tab data"""
@@ -6958,6 +7230,10 @@ def main():
             window.setWindowIcon(QIcon(icon_path))
         
         window.show()
+        
+        # Check for updates 3 seconds after startup (in background)
+        QTimer.singleShot(3000, window.check_for_updates_on_startup)
+        
         sys.exit(app.exec_())
     except Exception as e:
         print(f"Error starting application: {e}")
